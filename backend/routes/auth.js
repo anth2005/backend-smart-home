@@ -3,16 +3,72 @@ const router = express.Router();
 const jwt = require('jsonwebtoken');
 const User = require('../models/User');
 const { authGuard } = require('../middleware/auth');
+const nodemailer = require('nodemailer');
+
+// Lưu tạm thời OTP trên RAM (cho việc demo/chạy thử)
+const otpStore = new Map();
 
 // ============================================================
-// POST /api/auth/register – Đăng ký tài khoản mới
+// POST /api/auth/send-otp – Gửi mã OTP vào Email
+// ============================================================
+router.post('/send-otp', async (req, res, next) => {
+  try {
+    const { email, username } = req.body;
+    if (!email || !username) {
+      return res.status(400).json({ success: false, msg: 'Cần cung cấp username và email' });
+    }
+
+    // Kiểm tra xem username/email đã tồn tại chưa
+    const daTonTai = await User.findOne({ $or: [{ username }, { email }] });
+    if (daTonTai) {
+      return res.status(400).json({ success: false, msg: 'Tên đăng nhập hoặc Email đã được sử dụng' });
+    }
+
+    // Tạo mã OTP 6 số ngẫu nhiên
+    const otpCode = Math.floor(100000 + Math.random() * 900000).toString();
+    otpStore.set(email, otpCode);
+
+    console.log(`\n===========================================`);
+    console.log(` 📧 MÃ OTP GỬI CHO [${email}] LÀ: ${otpCode} `);
+    console.log(`===========================================\n`);
+
+    // Gửi email thật sự nếu có cấu hình SMTP (nếu không có thì in ra Console để Dev dễ làm)
+    if (process.env.SMTP_USER && process.env.SMTP_PASS) {
+      let transporter = nodemailer.createTransport({
+        service: 'gmail', // Hoặc host của bạn
+        auth: {
+          user: process.env.SMTP_USER,
+          pass: process.env.SMTP_PASS
+        }
+      });
+      await transporter.sendMail({
+        from: '"Hệ thống NEXUS" <no-reply@smarthome.local>',
+        to: email,
+        subject: "Mã Xác Nhận Đăng Ký Nhà Thông Minh",
+        text: `Mã OTP của bạn là: ${otpCode}. Mã này có hiệu lực 5 phút.`,
+      });
+    }
+
+    res.json({ success: true, msg: 'Đã gửi mã xác nhận tới Gmail của bạn.' });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// ============================================================
+// POST /api/auth/register – Đăng ký tài khoản mới qua OTP
 // ============================================================
 router.post('/register', async (req, res, next) => {
   try {
-    const { username, email, password, role } = req.body;
+    const { username, email, password, role, otp } = req.body;
 
-    if (!username || !password) {
-      return res.status(400).json({ success: false, msg: 'Tên đăng nhập và mật khẩu là bắt buộc' });
+    if (!username || !password || !email) {
+      return res.status(400).json({ success: false, msg: 'Vui lòng nhập đầy đủ thông tin' });
+    }
+
+    // Kiểm tra mã OTP
+    if (!otp || otpStore.get(email) !== otp) {
+      return res.status(400).json({ success: false, msg: 'Mã xác thực không đúng hoặc đã hết hạn' });
     }
 
     // Kiểm tra tên đăng nhập hoặc email đã tồn tại chưa
@@ -22,6 +78,9 @@ router.post('/register', async (req, res, next) => {
     }
 
     const nguoiDung = await User.create({ username, email, password, role });
+    
+    // Xóa OTP khỏi bộ nhớ sau khi đăng ký thành công
+    otpStore.delete(email);
 
     // Tạo JWT token sau khi đăng ký thành công
     const token = jwt.sign({ id: nguoiDung._id }, process.env.JWT_SECRET, { expiresIn: '1d' });
@@ -109,6 +168,60 @@ router.put('/change-password', authGuard, async (req, res, next) => {
 
     res.json({ success: true, msg: 'Đổi mật khẩu thành công' });
   } catch (err) {
+    next(err);
+  }
+});
+
+// ============================================================
+// POST /api/auth/oauth – Đăng nhập / Đăng ký qua OAuth (Google, GitHub)
+// ============================================================
+router.post('/oauth', async (req, res, next) => {
+  try {
+    const { provider, providerId, name, email, avatar } = req.body;
+
+    if (!email) {
+      return res.status(400).json({ success: false, msg: 'Không nhận được email từ nhà cung cấp' });
+    }
+
+    // Kiểm tra xem user này đã tồn tại chưa
+    let nguoiDung = await User.findOne({ email });
+
+    if (!nguoiDung) {
+      // Nếu chưa có, tự động chuyển email username thành tên đăng nhập
+      const baseUsername = email.split('@')[0];
+      let newUsername = baseUsername;
+      
+      // Chống trùng username
+      let exist = await User.findOne({ username: newUsername });
+      if (exist) {
+         newUsername = `${baseUsername}_${Date.now().toString().slice(-4)}`;
+      }
+
+      // Tạo user mới (với password ngẫu nhiên siêu dài vì họ dùng OAuth)
+      nguoiDung = await User.create({
+        username: newUsername,
+        email,
+        password: require('crypto').randomBytes(32).toString('hex'), // Mật khẩu ngẫu nhiên
+        role: 'user', // Mặc định role là user
+        isActive: true
+      });
+    }
+
+    // Cập nhật lastLogin
+    nguoiDung.lastLogin = new Date();
+    await nguoiDung.save({ validateBeforeSave: false });
+
+    // Tạo token cho user
+    const token = jwt.sign({ id: nguoiDung._id }, process.env.JWT_SECRET, { expiresIn: '1d' });
+
+    res.json({
+      success: true,
+      msg: 'Đăng nhập OAuth thành công',
+      token,
+      user: nguoiDung
+    });
+  } catch (err) {
+    console.error('Lỗi OAuth Auth:', err);
     next(err);
   }
 });
